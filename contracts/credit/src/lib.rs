@@ -49,13 +49,21 @@ impl Credit {
 
     /// Open a new credit line for a borrower (called by backend/risk engine).
     pub fn open_credit_line(
-        _env: Env,
-        _borrower: Address,
-        _credit_limit: i128,
-        _interest_rate_bps: u32,
-        _risk_score: u32,
+        env: Env,
+        borrower: Address,
+        credit_limit: i128,
+        interest_rate_bps: u32,
+        risk_score: u32,
     ) -> () {
-        // TODO: persist CreditLineData keyed by borrower
+        let credit_line = CreditLineData {
+            borrower,
+            credit_limit,
+            utilized_amount: 0,
+            interest_rate_bps,
+            risk_score,
+            status: CreditStatus::Active,
+        };
+        env.storage().instance().set(&Symbol::new(&env, "credit_line"), &credit_line);
         ()
     }
 
@@ -90,13 +98,23 @@ impl Credit {
 
     /// Update risk parameters (admin/risk engine).
     pub fn update_risk_parameters(
-        _env: Env,
+        env: Env,
         _borrower: Address,
-        _credit_limit: i128,
-        _interest_rate_bps: u32,
-        _risk_score: u32,
+        credit_limit: i128,
+        interest_rate_bps: u32,
+        risk_score: u32,
     ) -> () {
-        // TODO: update stored CreditLineData
+        let admin: Address = env.storage().instance().get(&Symbol::new(&env, "admin")).unwrap();
+        admin.require_auth();
+        
+        let key = Symbol::new(&env, "credit_line");
+        let mut credit_line: CreditLineData = env.storage().instance().get(&key).unwrap();
+        
+        credit_line.credit_limit = credit_limit;
+        credit_line.interest_rate_bps = interest_rate_bps;
+        credit_line.risk_score = risk_score;
+        
+        env.storage().instance().set(&key, &credit_line);
         ()
     }
 
@@ -110,6 +128,12 @@ impl Credit {
     pub fn close_credit_line(_env: Env, _borrower: Address) -> () {
         // TODO: set status to Closed
         ()
+    }
+
+    /// Get credit line data for a borrower (view function).
+    pub fn get_credit_line(env: Env, _borrower: Address) -> CreditLineData {
+        let key = Symbol::new(&env, "credit_line");
+        env.storage().instance().get(&key).unwrap()
     }
 }
 
@@ -221,5 +245,63 @@ mod test {
         
         // Timestamp should be captured at or after the call
         assert!(timestamp_before <= env.ledger().timestamp());
+    }
+
+    #[test]
+    fn test_update_risk_parameters_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+        
+        // Initialize contract and open credit line
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        
+        // Verify initial values
+        let credit_line = client.get_credit_line(&borrower);
+        assert_eq!(credit_line.credit_limit, 1000_i128);
+        assert_eq!(credit_line.interest_rate_bps, 300_u32);
+        assert_eq!(credit_line.risk_score, 70_u32);
+        
+        // Update risk parameters as admin
+        client.update_risk_parameters(&borrower, &2000_i128, &500_u32, &85_u32);
+        
+        // Verify updated values
+        let updated_credit_line = client.get_credit_line(&borrower);
+        assert_eq!(updated_credit_line.credit_limit, 2000_i128);
+        assert_eq!(updated_credit_line.interest_rate_bps, 500_u32);
+        assert_eq!(updated_credit_line.risk_score, 85_u32);
+        assert_eq!(updated_credit_line.borrower, borrower);
+        assert_eq!(updated_credit_line.status, CreditStatus::Active);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_update_risk_parameters_unauthorized() {
+        let env = Env::default();
+        
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let non_admin = Address::generate(&env);
+        
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+        
+        // Initialize contract and open credit line
+        env.mock_all_auths();
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        
+        // Stop mocking all auths and only mock non-admin
+        env.mock_all_auths_allowing_non_root_auth();
+        non_admin.require_auth();
+        
+        // Attempt to update as non-admin (should panic)
+        client.update_risk_parameters(&borrower, &2000_i128, &500_u32, &85_u32);
     }
 }
