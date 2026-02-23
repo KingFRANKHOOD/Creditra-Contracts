@@ -40,12 +40,28 @@ pub struct Credit;
 impl Credit {
     /// Initialize the contract (admin).
     pub fn init(env: Env, admin: Address) -> () {
-        env.storage().instance().set(&Symbol::new(&env, "admin"), &admin);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "admin"), &admin);
         ()
     }
 
     /// Open a new credit line for a borrower (called by backend/risk engine).
-    /// Emits a CreditLineOpened event.
+    ///
+    /// # Arguments
+    /// * `borrower` - The address of the borrower
+    /// * `credit_limit` - Maximum borrowable amount (must be > 0)
+    /// * `interest_rate_bps` - Annual interest rate in basis points (max 10000 = 100%)
+    /// * `risk_score` - Borrower risk score (0–100)
+    ///
+    /// # Panics
+    /// * If `credit_limit` <= 0
+    /// * If `interest_rate_bps` > 10000
+    /// * If `risk_score` > 100
+    /// * If an Active credit line already exists for the borrower
+    ///
+    /// # Events
+    /// Emits `(credit, opened)` with a `CreditLineEvent` payload.
     pub fn open_credit_line(
         env: Env,
         borrower: Address,
@@ -53,6 +69,25 @@ impl Credit {
         interest_rate_bps: u32,
         risk_score: u32,
     ) -> () {
+        assert!(credit_limit > 0, "credit_limit must be greater than zero");
+        assert!(
+            interest_rate_bps <= 10_000,
+            "interest_rate_bps cannot exceed 10000 (100%)"
+        );
+        assert!(risk_score <= 100, "risk_score must be between 0 and 100");
+
+        // Prevent overwriting an existing Active credit line
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<Address, CreditLineData>(&borrower)
+        {
+            assert!(
+                existing.status != CreditStatus::Active,
+                "borrower already has an active credit line"
+            );
+        }
+
         let credit_line = CreditLineData {
             borrower: borrower.clone(),
             credit_limit,
@@ -62,9 +97,7 @@ impl Credit {
             status: CreditStatus::Active,
         };
 
-        env.storage()
-            .persistent()
-            .set(&borrower, &credit_line);
+        env.storage().persistent().set(&borrower, &credit_line);
 
         // Emit CreditLineOpened event
         env.events().publish(
@@ -115,9 +148,7 @@ impl Credit {
             .expect("Credit line not found");
 
         credit_line.status = CreditStatus::Suspended;
-        env.storage()
-            .persistent()
-            .set(&borrower, &credit_line);
+        env.storage().persistent().set(&borrower, &credit_line);
 
         // Emit CreditLineSuspended event
         env.events().publish(
@@ -144,9 +175,7 @@ impl Credit {
             .expect("Credit line not found");
 
         credit_line.status = CreditStatus::Closed;
-        env.storage()
-            .persistent()
-            .set(&borrower, &credit_line);
+        env.storage().persistent().set(&borrower, &credit_line);
 
         // Emit CreditLineClosed event
         env.events().publish(
@@ -173,9 +202,7 @@ impl Credit {
             .expect("Credit line not found");
 
         credit_line.status = CreditStatus::Defaulted;
-        env.storage()
-            .persistent()
-            .set(&borrower, &credit_line);
+        env.storage().persistent().set(&borrower, &credit_line);
 
         // Emit CreditLineDefaulted event
         env.events().publish(
@@ -199,239 +226,4 @@ impl Credit {
 }
 
 #[cfg(test)]
-mod test {
-    use super::*;
-    use soroban_sdk::testutils::Address as _;
-
-    #[test]
-    fn test_init_and_open_credit_line() {
-        let env = Env::default();
-        env.mock_all_auths();
-        
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-
-        let contract_id = env.register(Credit, ());
-        let client = CreditClient::new(&env, &contract_id);
-
-        client.init(&admin);
-        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
-
-        // Verify credit line was created
-        let credit_line = client.get_credit_line(&borrower);
-        assert!(credit_line.is_some());
-        let credit_line = credit_line.unwrap();
-        assert_eq!(credit_line.borrower, borrower);
-        assert_eq!(credit_line.credit_limit, 1000);
-        assert_eq!(credit_line.utilized_amount, 0);
-        assert_eq!(credit_line.interest_rate_bps, 300);
-        assert_eq!(credit_line.risk_score, 70);
-        assert_eq!(credit_line.status, CreditStatus::Active);
-    }
-
-    #[test]
-    fn test_suspend_credit_line() {
-        let env = Env::default();
-        env.mock_all_auths();
-        
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-
-        let contract_id = env.register(Credit, ());
-        let client = CreditClient::new(&env, &contract_id);
-
-        client.init(&admin);
-        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
-        client.suspend_credit_line(&borrower);
-
-        // Verify status changed to Suspended
-        let credit_line = client.get_credit_line(&borrower).unwrap();
-        assert_eq!(credit_line.status, CreditStatus::Suspended);
-    }
-
-    #[test]
-    fn test_close_credit_line() {
-        let env = Env::default();
-        env.mock_all_auths();
-        
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-
-        let contract_id = env.register(Credit, ());
-        let client = CreditClient::new(&env, &contract_id);
-
-        client.init(&admin);
-        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
-        client.close_credit_line(&borrower);
-
-        // Verify status changed to Closed
-        let credit_line = client.get_credit_line(&borrower).unwrap();
-        assert_eq!(credit_line.status, CreditStatus::Closed);
-    }
-
-    #[test]
-    fn test_default_credit_line() {
-        let env = Env::default();
-        env.mock_all_auths();
-        
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-
-        let contract_id = env.register(Credit, ());
-        let client = CreditClient::new(&env, &contract_id);
-
-        client.init(&admin);
-        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
-        client.default_credit_line(&borrower);
-
-        // Verify status changed to Defaulted
-        let credit_line = client.get_credit_line(&borrower).unwrap();
-        assert_eq!(credit_line.status, CreditStatus::Defaulted);
-    }
-
-    #[test]
-    fn test_full_lifecycle() {
-        let env = Env::default();
-        env.mock_all_auths();
-        
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-
-        let contract_id = env.register(Credit, ());
-        let client = CreditClient::new(&env, &contract_id);
-
-        client.init(&admin);
-
-        // Open credit line
-        client.open_credit_line(&borrower, &5000_i128, &500_u32, &80_u32);
-        let credit_line = client.get_credit_line(&borrower).unwrap();
-        assert_eq!(credit_line.status, CreditStatus::Active);
-
-        // Suspend credit line
-        client.suspend_credit_line(&borrower);
-        let credit_line = client.get_credit_line(&borrower).unwrap();
-        assert_eq!(credit_line.status, CreditStatus::Suspended);
-
-        // Close credit line
-        client.close_credit_line(&borrower);
-        let credit_line = client.get_credit_line(&borrower).unwrap();
-        assert_eq!(credit_line.status, CreditStatus::Closed);
-    }
-
-    #[test]
-    fn test_event_data_integrity() {
-        let env = Env::default();
-        env.mock_all_auths();
-        
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-
-        let contract_id = env.register(Credit, ());
-        let client = CreditClient::new(&env, &contract_id);
-
-        client.init(&admin);
-        client.open_credit_line(&borrower, &2000_i128, &400_u32, &75_u32);
-
-        // Verify credit line data matches what was passed
-        let credit_line = client.get_credit_line(&borrower).unwrap();
-        assert_eq!(credit_line.borrower, borrower);
-        assert_eq!(credit_line.status, CreditStatus::Active);
-        assert_eq!(credit_line.credit_limit, 2000);
-        assert_eq!(credit_line.interest_rate_bps, 400);
-        assert_eq!(credit_line.risk_score, 75);
-    }
-
-    #[test]
-    #[should_panic(expected = "Credit line not found")]
-    fn test_suspend_nonexistent_credit_line() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-
-        let contract_id = env.register(Credit, ());
-        let client = CreditClient::new(&env, &contract_id);
-
-        client.init(&admin);
-        client.suspend_credit_line(&borrower);
-    }
-
-    #[test]
-    #[should_panic(expected = "Credit line not found")]
-    fn test_close_nonexistent_credit_line() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-
-        let contract_id = env.register(Credit, ());
-        let client = CreditClient::new(&env, &contract_id);
-
-        client.init(&admin);
-        client.close_credit_line(&borrower);
-    }
-
-    #[test]
-    #[should_panic(expected = "Credit line not found")]
-    fn test_default_nonexistent_credit_line() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-
-        let contract_id = env.register(Credit, ());
-        let client = CreditClient::new(&env, &contract_id);
-
-        client.init(&admin);
-        client.default_credit_line(&borrower);
-    }
-
-    #[test]
-    fn test_multiple_borrowers() {
-        let env = Env::default();
-        env.mock_all_auths();
-        
-        let admin = Address::generate(&env);
-        let borrower1 = Address::generate(&env);
-        let borrower2 = Address::generate(&env);
-
-        let contract_id = env.register(Credit, ());
-        let client = CreditClient::new(&env, &contract_id);
-
-        client.init(&admin);
-        client.open_credit_line(&borrower1, &1000_i128, &300_u32, &70_u32);
-        client.open_credit_line(&borrower2, &2000_i128, &400_u32, &80_u32);
-
-        let credit_line1 = client.get_credit_line(&borrower1).unwrap();
-        let credit_line2 = client.get_credit_line(&borrower2).unwrap();
-
-        assert_eq!(credit_line1.credit_limit, 1000);
-        assert_eq!(credit_line2.credit_limit, 2000);
-        assert_eq!(credit_line1.status, CreditStatus::Active);
-        assert_eq!(credit_line2.status, CreditStatus::Active);
-    }
-
-    #[test]
-    fn test_lifecycle_transitions() {
-        let env = Env::default();
-        env.mock_all_auths();
-        
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-
-        let contract_id = env.register(Credit, ());
-        let client = CreditClient::new(&env, &contract_id);
-
-        client.init(&admin);
-
-        // Test Active -> Defaulted
-        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
-        assert_eq!(
-            client.get_credit_line(&borrower).unwrap().status,
-            CreditStatus::Active
-        );
-
-        client.default_credit_line(&borrower);
-        assert_eq!(
-            client.get_credit_line(&borrower).unwrap().status,
-            CreditStatus::Defaulted
-        );
-    }
-}
+mod test;
