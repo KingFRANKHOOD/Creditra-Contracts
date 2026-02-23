@@ -40,7 +40,9 @@ pub struct Credit;
 impl Credit {
     /// Initialize the contract (admin).
     pub fn init(env: Env, admin: Address) -> () {
-        env.storage().instance().set(&Symbol::new(&env, "admin"), &admin);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "admin"), &admin);
         ()
     }
 
@@ -62,9 +64,7 @@ impl Credit {
             status: CreditStatus::Active,
         };
 
-        env.storage()
-            .persistent()
-            .set(&borrower, &credit_line);
+        env.storage().persistent().set(&borrower, &credit_line);
 
         // Emit CreditLineOpened event
         env.events().publish(
@@ -82,7 +82,17 @@ impl Credit {
     }
 
     /// Draw from credit line (borrower).
-    pub fn draw_credit(_env: Env, _borrower: Address, _amount: i128) -> () {
+    pub fn draw_credit(env: Env, borrower: Address, _amount: i128) -> () {
+        let credit_line: CreditLineData = env
+            .storage()
+            .persistent()
+            .get(&borrower)
+            .expect("Credit line not found");
+
+        if credit_line.status != CreditStatus::Active {
+            panic!("Credit line is not active");
+        }
+
         // TODO: check limit, update utilized_amount, transfer token to borrower
         ()
     }
@@ -115,9 +125,7 @@ impl Credit {
             .expect("Credit line not found");
 
         credit_line.status = CreditStatus::Suspended;
-        env.storage()
-            .persistent()
-            .set(&borrower, &credit_line);
+        env.storage().persistent().set(&borrower, &credit_line);
 
         // Emit CreditLineSuspended event
         env.events().publish(
@@ -144,9 +152,7 @@ impl Credit {
             .expect("Credit line not found");
 
         credit_line.status = CreditStatus::Closed;
-        env.storage()
-            .persistent()
-            .set(&borrower, &credit_line);
+        env.storage().persistent().set(&borrower, &credit_line);
 
         // Emit CreditLineClosed event
         env.events().publish(
@@ -173,9 +179,7 @@ impl Credit {
             .expect("Credit line not found");
 
         credit_line.status = CreditStatus::Defaulted;
-        env.storage()
-            .persistent()
-            .set(&borrower, &credit_line);
+        env.storage().persistent().set(&borrower, &credit_line);
 
         // Emit CreditLineDefaulted event
         env.events().publish(
@@ -201,13 +205,19 @@ impl Credit {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, EnvTestConfig};
+
+    fn test_env() -> Env {
+        Env::new_with_config(EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        })
+    }
 
     #[test]
     fn test_init_and_open_credit_line() {
-        let env = Env::default();
+        let env = test_env();
         env.mock_all_auths();
-        
+
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
 
@@ -231,9 +241,9 @@ mod test {
 
     #[test]
     fn test_suspend_credit_line() {
-        let env = Env::default();
+        let env = test_env();
         env.mock_all_auths();
-        
+
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
 
@@ -250,10 +260,54 @@ mod test {
     }
 
     #[test]
-    fn test_close_credit_line() {
-        let env = Env::default();
+    #[should_panic(expected = "Credit line is not active")]
+    fn test_draw_credit_reverts_when_suspended() {
+        let env = test_env();
         env.mock_all_auths();
-        
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        client.suspend_credit_line(&borrower);
+
+        // Should revert due to suspended status.
+        client.draw_credit(&borrower, &1_i128);
+    }
+
+    #[test]
+    fn test_repay_credit_succeeds_when_suspended() {
+        let env = test_env();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        client.draw_credit(&borrower, &1_i128);
+        client.suspend_credit_line(&borrower);
+
+        // Repay should still succeed while suspended.
+        client.repay_credit(&borrower, &50_i128);
+
+        let credit_line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(credit_line.status, CreditStatus::Suspended);
+        assert_eq!(credit_line.utilized_amount, 0);
+    }
+
+    #[test]
+    fn test_close_credit_line() {
+        let env = test_env();
+        env.mock_all_auths();
+
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
 
@@ -271,9 +325,9 @@ mod test {
 
     #[test]
     fn test_default_credit_line() {
-        let env = Env::default();
+        let env = test_env();
         env.mock_all_auths();
-        
+
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
 
@@ -291,9 +345,9 @@ mod test {
 
     #[test]
     fn test_full_lifecycle() {
-        let env = Env::default();
+        let env = test_env();
         env.mock_all_auths();
-        
+
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
 
@@ -320,9 +374,9 @@ mod test {
 
     #[test]
     fn test_event_data_integrity() {
-        let env = Env::default();
+        let env = test_env();
         env.mock_all_auths();
-        
+
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
 
@@ -342,9 +396,27 @@ mod test {
     }
 
     #[test]
+    fn test_update_risk_parameters_does_not_panic() {
+        let env = test_env();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+
+        client.update_risk_parameters(&borrower, &2000_i128, &500_u32, &85_u32);
+        assert!(client.get_credit_line(&borrower).is_some());
+    }
+
+    #[test]
     #[should_panic(expected = "Credit line not found")]
     fn test_suspend_nonexistent_credit_line() {
-        let env = Env::default();
+        let env = test_env();
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
 
@@ -358,7 +430,7 @@ mod test {
     #[test]
     #[should_panic(expected = "Credit line not found")]
     fn test_close_nonexistent_credit_line() {
-        let env = Env::default();
+        let env = test_env();
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
 
@@ -372,7 +444,7 @@ mod test {
     #[test]
     #[should_panic(expected = "Credit line not found")]
     fn test_default_nonexistent_credit_line() {
-        let env = Env::default();
+        let env = test_env();
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
 
@@ -385,9 +457,9 @@ mod test {
 
     #[test]
     fn test_multiple_borrowers() {
-        let env = Env::default();
+        let env = test_env();
         env.mock_all_auths();
-        
+
         let admin = Address::generate(&env);
         let borrower1 = Address::generate(&env);
         let borrower2 = Address::generate(&env);
@@ -410,9 +482,9 @@ mod test {
 
     #[test]
     fn test_lifecycle_transitions() {
-        let env = Env::default();
+        let env = test_env();
         env.mock_all_auths();
-        
+
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
 
