@@ -11,7 +11,7 @@
 mod events;
 mod types;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
 
 use events::{
     publish_credit_line_event, publish_repayment_event, publish_risk_parameters_updated,
@@ -55,14 +55,6 @@ impl Into<soroban_sdk::Error> for CreditError {
     }
 }
 
-#[contracttype]
-pub struct CreditLineData {
-    pub borrower: Address,
-    pub credit_limit: i128,
-    pub utilized_amount: i128,
-    pub interest_rate_bps: u32,
-    pub risk_score: u32,
-    pub status: CreditStatus,
 fn require_admin_auth(env: &Env) -> Address {
     let admin = require_admin(env);
     admin.require_auth();
@@ -130,92 +122,8 @@ impl Credit {
         ()
     }
 
-    /// Draw from credit line (borrower).
-    pub fn draw_credit(env: Env, borrower: Address, amount: i128) -> () {
-        if amount <= 0 {
-            panic_with_error!(&env, CreditError::InvalidAmount);
-        }
-
-        let credit_key = (Symbol::new(&env, "CREDIT_LINE"), borrower.clone());
-        let mut credit_data: CreditLineData = env.storage().persistent().get(&credit_key)
-            .unwrap_or_else(|| panic_with_error!(&env, CreditError::CreditLineNotFound));
-
-        if credit_data.status != CreditStatus::Active {
-            panic_with_error!(&env, CreditError::InvalidCreditStatus);
-        }
-
-        let available_credit = credit_data.credit_limit.checked_sub(credit_data.utilized_amount)
-            .expect("Credit limit should be >= utilized amount");
-        
-        if amount > available_credit {
-            panic_with_error!(&env, CreditError::InsufficientUtilization);
-        }
-
-        credit_data.utilized_amount = credit_data.utilized_amount.checked_add(amount)
-            .expect("Utilized amount should not overflow credit limit");
-
-        env.storage().persistent().set(&credit_key, &credit_data);
-
-        // Emit draw event
-        env.events().publish(
-            (Symbol::new(&env, "draw"), borrower.clone()),
-            (amount, credit_data.utilized_amount)
-        );
-    }
-
-    /// Repay credit (borrower).
-    /// 
-    /// Repays the specified amount from the borrower's credit line.
-    /// The amount is applied to reduce the utilized_amount, with any excess
-    /// amount ignored (no refund for overpayment).
-    /// 
-    /// # Arguments
-    /// * `borrower` - The address of the borrower making the repayment
-    /// * `amount` - The repayment amount (must be > 0)
-    /// 
-    /// # Errors
-    /// * `CreditLineNotFound` - If no credit line exists for the borrower
-    /// * `InvalidCreditStatus` - If credit line is not Active or Suspended
-    /// * `InvalidAmount` - If amount <= 0
-    /// 
-    /// # Events
-    /// Emits a repayment event with borrower address and amount applied
-    pub fn repay_credit(env: Env, borrower: Address, amount: i128) -> () {
-        // Validate input
-        if amount <= 0 {
-            panic_with_error!(&env, CreditError::InvalidAmount);
-        }
-
-        // Get credit line data
-        let credit_key = (Symbol::new(&env, "CREDIT_LINE"), borrower.clone());
-        let mut credit_data: CreditLineData = env.storage().persistent().get(&credit_key)
-            .unwrap_or_else(|| panic_with_error!(&env, CreditError::CreditLineNotFound));
-
-        // Validate credit status
-        if credit_data.status != CreditStatus::Active && credit_data.status != CreditStatus::Suspended {
-            panic_with_error!(&env, CreditError::InvalidCreditStatus);
-        }
-
-        // Calculate amount to apply (capped at current utilization)
-        let amount_to_apply = if amount > credit_data.utilized_amount {
-            credit_data.utilized_amount
-        } else {
-            amount
-        };
-
-        // Update utilized amount
-        credit_data.utilized_amount = credit_data.utilized_amount.checked_sub(amount_to_apply)
-            .expect("Underflow should not occur with proper validation");
-
-        // Store updated credit line data
-        env.storage().persistent().set(&credit_key, &credit_data);
-
-        // Emit repayment event
-        env.events().publish(
-            (Symbol::new(&env, "repayment"), borrower.clone()),
-            (amount_to_apply, credit_data.utilized_amount)
-        );
-
+    
+    
     /// Reverts if credit line does not exist, is Closed, or borrower has not authorized.
     pub fn draw_credit(env: Env, borrower: Address, amount: i128) -> () {
         set_reentrancy_guard(&env);
@@ -469,6 +377,38 @@ mod test {
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::testutils::Events;
 
+    /// Helper function to set up test environment with admin, borrower, and contract
+    fn setup_test(env: &Env) -> (Address, Address, Address) {
+        let admin = Address::generate(env);
+        let borrower = Address::generate(env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(env, &contract_id);
+        
+        env.mock_all_auths();
+        
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        
+        (admin, borrower, contract_id)
+    }
+
+    /// Helper function to call contract methods within contract context
+    fn call_contract<F>(env: &Env, contract_id: &Address, f: F)
+    where
+        F: FnOnce(),
+    {
+        env.mock_all_auths();
+        env.as_contract(contract_id, f);
+    }
+
+    /// Helper function to get credit line data
+    fn get_credit_data(env: &Env, contract_id: &Address, borrower: &Address) -> CreditLineData {
+        env.as_contract(contract_id, || {
+            Credit::get_credit_line(env.clone(), borrower.clone())
+                .expect("Credit line should exist")
+        })
+    }
+
     #[test]
     fn test_init_and_open_credit_line() {
         let env = Env::default();
@@ -539,6 +479,17 @@ mod test {
 
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        client.default_credit_line(&borrower);
+
+        let credit_line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(credit_line.status, CreditStatus::Defaulted);
+    }
 
     #[test]
     fn test_draw_credit() {
@@ -641,11 +592,10 @@ mod test {
         });
         
         // Manually set status to Suspended
-        let credit_key = (Symbol::new(&env, "CREDIT_LINE"), borrower.clone());
         let mut credit_data = get_credit_data(&env, &contract_id, &borrower);
         credit_data.status = CreditStatus::Suspended;
         env.as_contract(&contract_id, || {
-            env.storage().persistent().set(&credit_key, &credit_data);
+            env.storage().persistent().set(&borrower, &credit_data);
         });
         
         // Should be able to repay even when suspended
@@ -659,7 +609,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #3)")]
+    #[should_panic(expected = "amount must be positive")]
     fn test_repay_credit_invalid_amount_zero() {
         let env = Env::default();
         let (_admin, borrower, contract_id) = setup_test(&env);
@@ -670,7 +620,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #3)")]
+    #[should_panic(expected = "amount must be positive")]
     fn test_repay_credit_invalid_amount_negative() {
         let env = Env::default();
         let (_admin, borrower, contract_id) = setup_test(&env);
@@ -678,14 +628,6 @@ mod test {
         call_contract(&env, &contract_id, || {
             Credit::repay_credit(env.clone(), borrower.clone(),-100_i128);
         });
-    }
-
-        client.init(&admin);
-        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
-        client.default_credit_line(&borrower);
-
-        let credit_line = client.get_credit_line(&borrower).unwrap();
-        assert_eq!(credit_line.status, CreditStatus::Defaulted);
     }
 
     #[test]
