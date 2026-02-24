@@ -122,8 +122,6 @@ impl Credit {
         ()
     }
 
-    
-    
     /// Reverts if credit line does not exist, is Closed, or borrower has not authorized.
     pub fn draw_credit(env: Env, borrower: Address, amount: i128) -> () {
         set_reentrancy_guard(&env);
@@ -383,12 +381,12 @@ mod test {
         let borrower = Address::generate(env);
         let contract_id = env.register(Credit, ());
         let client = CreditClient::new(env, &contract_id);
-        
+
         env.mock_all_auths();
-        
+
         client.init(&admin);
         client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
-        
+
         (admin, borrower, contract_id)
     }
 
@@ -495,14 +493,14 @@ mod test {
     fn test_draw_credit() {
         let env = Env::default();
         let (_admin, borrower, contract_id) = setup_test(&env);
-        
+
         call_contract(&env, &contract_id, || {
             Credit::draw_credit(env.clone(), borrower.clone(), 500_i128);
         });
-        
+
         let credit_data = get_credit_data(&env, &contract_id, &borrower);
         assert_eq!(credit_data.utilized_amount, 500_i128);
-        
+
         // Events are emitted - functionality verified through storage changes
     }
 
@@ -510,18 +508,21 @@ mod test {
     fn test_repay_credit_partial() {
         let env = Env::default();
         let (_admin, borrower, contract_id) = setup_test(&env);
-        
+
         // First draw some credit
         call_contract(&env, &contract_id, || {
             Credit::draw_credit(env.clone(), borrower.clone(), 500_i128);
         });
-        assert_eq!(get_credit_data(&env, &contract_id, &borrower).utilized_amount, 500_i128);
-        
+        assert_eq!(
+            get_credit_data(&env, &contract_id, &borrower).utilized_amount,
+            500_i128
+        );
+
         // Partial repayment
         call_contract(&env, &contract_id, || {
             Credit::repay_credit(env.clone(), borrower.clone(), 200_i128);
         });
-        
+
         let credit_data = get_credit_data(&env, &contract_id, &borrower);
         assert_eq!(credit_data.utilized_amount, 300_i128); // 500 - 200
     }
@@ -530,18 +531,21 @@ mod test {
     fn test_repay_credit_full() {
         let env = Env::default();
         let (_admin, borrower, contract_id) = setup_test(&env);
-        
+
         // Draw some credit
         call_contract(&env, &contract_id, || {
             Credit::draw_credit(env.clone(), borrower.clone(), 500_i128);
         });
-        assert_eq!(get_credit_data(&env, &contract_id, &borrower).utilized_amount, 500_i128);
-        
+        assert_eq!(
+            get_credit_data(&env, &contract_id, &borrower).utilized_amount,
+            500_i128
+        );
+
         // Full repayment
         call_contract(&env, &contract_id, || {
             Credit::repay_credit(env.clone(), borrower.clone(), 500_i128);
         });
-        
+
         let credit_data = get_credit_data(&env, &contract_id, &borrower);
         assert_eq!(credit_data.utilized_amount, 0_i128); // Fully repaid
     }
@@ -550,18 +554,21 @@ mod test {
     fn test_repay_credit_overpayment() {
         let env = Env::default();
         let (_admin, borrower, contract_id) = setup_test(&env);
-        
+
         // Draw some credit
         call_contract(&env, &contract_id, || {
-            Credit::draw_credit(env.clone(), borrower.clone(),300_i128);
+            Credit::draw_credit(env.clone(), borrower.clone(), 300_i128);
         });
-        assert_eq!(get_credit_data(&env, &contract_id, &borrower).utilized_amount, 300_i128);
-        
+        assert_eq!(
+            get_credit_data(&env, &contract_id, &borrower).utilized_amount,
+            300_i128
+        );
+
         // Overpayment (pay more than utilized)
         call_contract(&env, &contract_id, || {
-            Credit::repay_credit(env.clone(), borrower.clone(),500_i128);
+            Credit::repay_credit(env.clone(), borrower.clone(), 500_i128);
         });
-        
+
         let credit_data = get_credit_data(&env, &contract_id, &borrower);
         assert_eq!(credit_data.utilized_amount, 0_i128); // Should be capped at 0
     }
@@ -570,39 +577,38 @@ mod test {
     fn test_repay_credit_zero_utilization() {
         let env = Env::default();
         let (_admin, borrower, contract_id) = setup_test(&env);
-        
+
         // Try to repay when no credit is utilized
         call_contract(&env, &contract_id, || {
-            Credit::repay_credit(env.clone(), borrower.clone(),100_i128);
+            Credit::repay_credit(env.clone(), borrower.clone(), 100_i128);
         });
-        
+
         let credit_data = get_credit_data(&env, &contract_id, &borrower);
         assert_eq!(credit_data.utilized_amount, 0_i128); // Should remain 0
-        
     }
 
     #[test]
     fn test_repay_credit_suspended_status() {
         let env = Env::default();
         let (_admin, borrower, contract_id) = setup_test(&env);
-        
+
         // Draw some credit
         call_contract(&env, &contract_id, || {
-            Credit::draw_credit(env.clone(), borrower.clone(),500_i128);
+            Credit::draw_credit(env.clone(), borrower.clone(), 500_i128);
         });
-        
+
         // Manually set status to Suspended
         let mut credit_data = get_credit_data(&env, &contract_id, &borrower);
         credit_data.status = CreditStatus::Suspended;
         env.as_contract(&contract_id, || {
             env.storage().persistent().set(&borrower, &credit_data);
         });
-        
+
         // Should be able to repay even when suspended
         call_contract(&env, &contract_id, || {
-            Credit::repay_credit(env.clone(), borrower.clone(),200_i128);
+            Credit::repay_credit(env.clone(), borrower.clone(), 200_i128);
         });
-        
+
         let updated_data = get_credit_data(&env, &contract_id, &borrower);
         assert_eq!(updated_data.utilized_amount, 300_i128);
         assert_eq!(updated_data.status, CreditStatus::Suspended); // Status should remain Suspended
@@ -613,9 +619,9 @@ mod test {
     fn test_repay_credit_invalid_amount_zero() {
         let env = Env::default();
         let (_admin, borrower, contract_id) = setup_test(&env);
-        
+
         call_contract(&env, &contract_id, || {
-            Credit::repay_credit(env.clone(), borrower.clone(),0_i128);
+            Credit::repay_credit(env.clone(), borrower.clone(), 0_i128);
         });
     }
 
@@ -624,7 +630,7 @@ mod test {
     fn test_repay_credit_invalid_amount_negative() {
         let env = Env::default();
         let (_admin, borrower, contract_id) = setup_test(&env);
-        
+
         let negative_amount: i128 = -100;
         call_contract(&env, &contract_id, || {
             Credit::repay_credit(env.clone(), borrower.clone(), negative_amount);
