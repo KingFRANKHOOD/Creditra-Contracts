@@ -1797,3 +1797,405 @@ mod test {
         assert_eq!(default_data.risk_score, risk_score);
     }
 }
+
+// ============================================================
+// Tests: close_credit_line with outstanding utilization
+// Branch: tests/close-utilized-nonzero
+// ============================================================
+//
+// These tests verify the contract's behavior when close_credit_line is called
+// while the borrower has a non-zero utilized_amount.
+//
+// Scenarios covered:
+//   1. Borrower is rejected even when utilized_amount == 1 (minimum non-zero).
+//   2. Borrower is rejected when utilized_amount equals the full credit limit.
+//   3. Admin force-close succeeds and the utilized_amount is preserved in storage.
+//   4. Admin force-close emits exactly one CreditLineClosed event.
+//   5. Borrower is rejected on a Suspended line that has outstanding utilization.
+//   6. Admin can force-close a Suspended line that has outstanding utilization.
+//   7. Borrower succeeds in closing after fully repaying all outstanding debt.
+//   8. A third-party address (neither admin nor borrower) is rejected even when
+//      utilized_amount is zero.
+//   9. Admin force-close succeeds after multiple sequential draws.
+#[cfg(test)]
+mod test_close_utilized {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Events;
+
+    // ------------------------------------------------------------------
+    // 1. Borrower rejected even when utilized_amount == 1 (minimum non-zero)
+    // ------------------------------------------------------------------
+    /// Verifies that a borrower cannot close their own credit line when
+    /// utilized_amount is as small as 1.  The contract must panic with the
+    /// message "cannot close: utilized amount not zero".
+    #[test]
+    #[should_panic(expected = "cannot close: utilized amount not zero")]
+    fn test_close_utilized_borrower_rejected_at_minimum_utilization() {
+        let env = soroban_sdk::Env::default();
+        env.mock_all_auths();
+
+        let admin = soroban_sdk::Address::generate(&env);
+        let borrower = soroban_sdk::Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        // Open a line with limit 1000 and draw the minimum non-zero amount.
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        client.draw_credit(&borrower, &1_i128);
+
+        // utilized_amount == 1; borrower must be rejected.
+        client.close_credit_line(&borrower, &borrower);
+    }
+
+    // ------------------------------------------------------------------
+    // 2. Borrower rejected when utilized_amount equals the full credit limit
+    // ------------------------------------------------------------------
+    /// Verifies that a borrower cannot close their own credit line when the
+    /// entire credit limit has been drawn (utilized_amount == credit_limit).
+    #[test]
+    #[should_panic(expected = "cannot close: utilized amount not zero")]
+    fn test_close_utilized_borrower_rejected_at_full_utilization() {
+        let env = soroban_sdk::Env::default();
+        env.mock_all_auths();
+
+        let admin = soroban_sdk::Address::generate(&env);
+        let borrower = soroban_sdk::Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        // Draw the full credit limit.
+        client.open_credit_line(&borrower, &500_i128, &300_u32, &70_u32);
+        client.draw_credit(&borrower, &500_i128);
+
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            500,
+            "pre-condition: utilized_amount must equal credit_limit"
+        );
+
+        // Borrower must be rejected.
+        client.close_credit_line(&borrower, &borrower);
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Admin force-close preserves utilized_amount in storage
+    // ------------------------------------------------------------------
+    /// Verifies that when the admin force-closes a credit line that has
+    /// outstanding utilization, the stored utilized_amount is NOT zeroed out —
+    /// it is preserved so that the debt record remains auditable.
+    #[test]
+    fn test_close_utilized_admin_force_close_preserves_utilized_amount() {
+        let env = soroban_sdk::Env::default();
+        env.mock_all_auths();
+
+        let admin = soroban_sdk::Address::generate(&env);
+        let borrower = soroban_sdk::Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        client.draw_credit(&borrower, &750_i128);
+
+        // Admin force-closes the line.
+        client.close_credit_line(&borrower, &admin);
+
+        let credit_line = client.get_credit_line(&borrower).unwrap();
+
+        // Status must be Closed.
+        assert_eq!(
+            credit_line.status,
+            CreditStatus::Closed,
+            "status must be Closed after admin force-close"
+        );
+        // utilized_amount must be preserved (not zeroed).
+        assert_eq!(
+            credit_line.utilized_amount, 750,
+            "utilized_amount must be preserved after admin force-close"
+        );
+        // Other fields must be unchanged.
+        assert_eq!(credit_line.credit_limit, 1000);
+        assert_eq!(credit_line.interest_rate_bps, 300);
+        assert_eq!(credit_line.risk_score, 70);
+    }
+
+    // ------------------------------------------------------------------
+    // 4. Admin force-close emits exactly one CreditLineClosed event
+    // ------------------------------------------------------------------
+    /// Verifies that admin force-closing a credit line with outstanding
+    /// utilization emits exactly one event and that the event carries the
+    /// correct status (Closed) and the correct utilized_amount.
+    #[test]
+    fn test_close_utilized_admin_force_close_emits_closed_event() {
+        let env = soroban_sdk::Env::default();
+        env.mock_all_auths();
+
+        let admin = soroban_sdk::Address::generate(&env);
+        let borrower = soroban_sdk::Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        client.draw_credit(&borrower, &400_i128);
+
+        let events_before = env.events().all().len();
+
+        // Admin force-closes the line.
+        client.close_credit_line(&borrower, &admin);
+
+        let events_after = env.events().all().len();
+
+        // Exactly one event must be emitted by close_credit_line.
+        assert_eq!(
+            events_after,
+            events_before + 1,
+            "close_credit_line must emit exactly one CreditLineClosed event"
+        );
+
+        // The credit line must be Closed.
+        let credit_line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(credit_line.status, CreditStatus::Closed);
+        assert_eq!(
+            credit_line.utilized_amount, 400,
+            "utilized_amount must be preserved in the closed state"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 5. Borrower rejected on a Suspended line with outstanding utilization
+    // ------------------------------------------------------------------
+    /// Verifies that a borrower cannot close a Suspended credit line when
+    /// utilized_amount is non-zero.  The contract must panic with the message
+    /// "cannot close: utilized amount not zero".
+    #[test]
+    #[should_panic(expected = "cannot close: utilized amount not zero")]
+    fn test_close_utilized_borrower_rejected_on_suspended_line() {
+        let env = soroban_sdk::Env::default();
+        env.mock_all_auths();
+
+        let admin = soroban_sdk::Address::generate(&env);
+        let borrower = soroban_sdk::Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        // Draw while Active (draw_credit rejects Closed, not Suspended).
+        client.draw_credit(&borrower, &200_i128);
+        // Admin suspends the line.
+        client.suspend_credit_line(&borrower);
+
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().status,
+            CreditStatus::Suspended,
+            "pre-condition: line must be Suspended"
+        );
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            200,
+            "pre-condition: utilized_amount must be 200"
+        );
+
+        // Borrower must be rejected even on a Suspended line.
+        client.close_credit_line(&borrower, &borrower);
+    }
+
+    // ------------------------------------------------------------------
+    // 6. Admin can force-close a Suspended line with outstanding utilization
+    // ------------------------------------------------------------------
+    /// Verifies that the admin can force-close a Suspended credit line that
+    /// has outstanding utilization, and that the resulting state is Closed
+    /// with the utilized_amount preserved.
+    #[test]
+    fn test_close_utilized_admin_force_close_suspended_line() {
+        let env = soroban_sdk::Env::default();
+        env.mock_all_auths();
+
+        let admin = soroban_sdk::Address::generate(&env);
+        let borrower = soroban_sdk::Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        client.draw_credit(&borrower, &600_i128);
+        client.suspend_credit_line(&borrower);
+
+        // Admin force-closes the Suspended line.
+        client.close_credit_line(&borrower, &admin);
+
+        let credit_line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(
+            credit_line.status,
+            CreditStatus::Closed,
+            "status must be Closed after admin force-close of Suspended line"
+        );
+        assert_eq!(
+            credit_line.utilized_amount, 600,
+            "utilized_amount must be preserved after force-close of Suspended line"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 7. Borrower succeeds in closing after fully repaying all outstanding debt
+    // ------------------------------------------------------------------
+    /// Verifies the happy-path: a borrower who drew credit and then fully
+    /// repaid it (utilized_amount == 0) is allowed to close their own line.
+    #[test]
+    fn test_close_utilized_borrower_succeeds_after_full_repayment() {
+        let env = soroban_sdk::Env::default();
+        env.mock_all_auths();
+
+        let admin = soroban_sdk::Address::generate(&env);
+        let borrower = soroban_sdk::Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        client.draw_credit(&borrower, &350_i128);
+
+        // Fully repay the outstanding debt.
+        client.repay_credit(&borrower, &350_i128);
+
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            0,
+            "pre-condition: utilized_amount must be 0 after full repayment"
+        );
+
+        // Borrower must now be allowed to close.
+        client.close_credit_line(&borrower, &borrower);
+
+        let credit_line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(
+            credit_line.status,
+            CreditStatus::Closed,
+            "status must be Closed after borrower closes with zero utilization"
+        );
+        assert_eq!(credit_line.utilized_amount, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // 8. Third-party rejected even when utilized_amount is zero
+    // ------------------------------------------------------------------
+    /// Verifies that an address that is neither the admin nor the borrower
+    /// cannot close a credit line, regardless of the utilized_amount.
+    #[test]
+    #[should_panic(expected = "unauthorized")]
+    fn test_close_utilized_third_party_rejected_with_zero_utilization() {
+        let env = soroban_sdk::Env::default();
+        env.mock_all_auths();
+
+        let admin = soroban_sdk::Address::generate(&env);
+        let borrower = soroban_sdk::Address::generate(&env);
+        let third_party = soroban_sdk::Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        // Open with zero utilization so the only rejection reason is authorization.
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            0,
+            "pre-condition: utilized_amount must be 0"
+        );
+
+        // Third-party must be rejected with "unauthorized".
+        client.close_credit_line(&borrower, &third_party);
+    }
+
+    // ------------------------------------------------------------------
+    // 9. Admin force-close succeeds after multiple sequential draws
+    // ------------------------------------------------------------------
+    /// Verifies that the admin can force-close a credit line whose
+    /// utilized_amount was built up through multiple sequential draw_credit
+    /// calls, and that the final utilized_amount is preserved correctly.
+    #[test]
+    fn test_close_utilized_admin_force_close_multiple_draws() {
+        let env = soroban_sdk::Env::default();
+        env.mock_all_auths();
+
+        let admin = soroban_sdk::Address::generate(&env);
+        let borrower = soroban_sdk::Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+
+        // Multiple sequential draws.
+        client.draw_credit(&borrower, &100_i128);
+        client.draw_credit(&borrower, &150_i128);
+        client.draw_credit(&borrower, &250_i128);
+
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            500,
+            "pre-condition: utilized_amount must be 500 after three draws"
+        );
+
+        // Admin force-closes the line.
+        client.close_credit_line(&borrower, &admin);
+
+        let credit_line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(
+            credit_line.status,
+            CreditStatus::Closed,
+            "status must be Closed after admin force-close"
+        );
+        assert_eq!(
+            credit_line.utilized_amount, 500,
+            "utilized_amount must be preserved (100 + 150 + 250 = 500)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 10. Borrower rejected after partial repayment (utilized_amount still > 0)
+    // ------------------------------------------------------------------
+    /// Verifies that a borrower who has partially repaid their debt but still
+    /// has a non-zero utilized_amount cannot close their own credit line.
+    #[test]
+    #[should_panic(expected = "cannot close: utilized amount not zero")]
+    fn test_close_utilized_borrower_rejected_after_partial_repayment() {
+        let env = soroban_sdk::Env::default();
+        env.mock_all_auths();
+
+        let admin = soroban_sdk::Address::generate(&env);
+        let borrower = soroban_sdk::Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        client.draw_credit(&borrower, &400_i128);
+
+        // Partial repayment — still 200 outstanding.
+        client.repay_credit(&borrower, &200_i128);
+
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            200,
+            "pre-condition: utilized_amount must be 200 after partial repayment"
+        );
+
+        // Borrower must still be rejected.
+        client.close_credit_line(&borrower, &borrower);
+    }
+}
