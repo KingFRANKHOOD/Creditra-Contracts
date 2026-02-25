@@ -4,7 +4,7 @@ Soroban smart contracts for the Creditra adaptive credit protocol on Stellar.
 
 ## About
 
-This repo contains the **credit** contract: it will maintain credit lines, track utilization, enforce limits, and expose methods for opening lines, drawing, repaying, and updating risk parameters. The current code is a **stub** with the correct API and data types; full logic (storage, token transfers, interest) is to be implemented.
+This repo contains the **credit** contract: it will maintain credit lines, track utilization, enforce limits, and expose methods for opening lines, drawing, repaying, and updating risk parameters. The contract includes core logic for state management and events; additional features like interest accrual and token transfers are future enhancements.
 
 **Contract data model:**
 
@@ -66,19 +66,55 @@ cargo test -p creditra-credit
 Once the Soroban CLI and a network are configured:
 
 ```bash
+make build
+```
+
+Or manually:
+
+```bash
 soroban contract deploy --wasm target/wasm32-unknown-unknown/release/creditra_credit.wasm --source <identity> --network <network>
 ```
 
 See [Stellar Soroban docs](https://developers.stellar.org/docs/smart-contracts) for details.
 
-## Project layout
-
-- `Cargo.toml` — workspace and release profile (opt for contract size)
 - `contracts/credit/` — credit line contract
   - `Cargo.toml` — crate config, soroban-sdk dependency
-  - `src/lib.rs` — contract types and impl (stubs)
+  - `src/lib.rs` — contract types and impl
 
-## Merging to remote
+## Testing and Coverage
+
+### Run tests
+
+```bash
+make test
+```
+
+### Test Coverage
+
+This project uses `cargo-tarpaulin` to generate test coverage reports. We enforce a minimum of **95%** line coverage.
+
+#### Local Coverage Report
+
+To run coverage locally, install `cargo-tarpaulin`:
+
+```bash
+cargo install cargo-tarpaulin
+```
+
+Then run the coverage command:
+
+```bash
+make coverage
+```
+
+The report will be generated in `coverage/tarpaulin-report.html`.
+
+#### Maintaining Coverage
+
+To maintain high coverage:
+1. Ensure every new function has corresponding unit tests.
+2. Test both success and failure (panic) paths using `#[should_panic]`.
+3. Use `cargo tarpaulin --fail-under 95` as a gatekeeper before merging.
 
 This repo is a standalone git repository. After adding your remote:
 
